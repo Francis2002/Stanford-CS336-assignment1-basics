@@ -1,7 +1,5 @@
 from cs336_basics.bpe_utils import pre_tokenize_chunks_with_specials, split_with_specials
-from collections.abc import Iterable, Iterator
-from .tokenizer_BPE import train_bpe
-import regex as re
+from collections.abc import Iterable, Iterator, Sequence
 
 class Tokenizer():
 
@@ -38,18 +36,49 @@ class Tokenizer():
 
         return cls(vocab, merges, special_tokens=special_tokens)
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str, logging=False) -> list[int]:
         """
             Encode an input text into a sequence of token IDs.
         """
+
+        if logging:
+            import time
+            start_time = time.perf_counter()
+            print("Started encoding")
 
         # Split text into chunks with specials in between like ['hello, I', '<special>', 'would not', ...]
         chunks = split_with_specials(text, self.special_tokens)
         chunks = pre_tokenize_chunks_with_specials(chunks, self.special_tokens)
 
+        if logging:
+            print("Pretokenization complete")
+            total_pre_tokens = sum(
+                len(chunk) if isinstance(chunk, Sequence) else 1
+                for chunk in chunks
+            )
+            print(f"Number of pre_tokens: {total_pre_tokens}")
+            pre_token_cnt = -1
+
         sequence_of_token_ids = []
         for chunk in chunks:
             for pre_token in chunk:
+                if logging:
+                    pre_token_cnt+=1
+                if logging and pre_token_cnt % 5000 == 0:
+                    time_elapsed = time.perf_counter() - start_time
+                    print(f"{pre_token_cnt}/{total_pre_tokens} pre tokens processed")
+
+                    # Print compression ratio (bytes/token), by: 
+                    # 1. converting each token to bytes
+                    # 2. summing the bytes of all tokens
+                    # 3. dividing by the number of tokens
+                    if sequence_of_token_ids: 
+                        sum_bytes = sum(len(my_tokenizer.vocab[token_id]) for token_id in sequence_of_token_ids)
+                        print(f"Current compression ratio: {sum_bytes / len(sequence_of_token_ids)}")
+                        print(f"Bytes per sercond: {sum_bytes / time_elapsed}")
+
+                    print(f"Time elapsed: {time_elapsed:.4f}s\n")
+
                 if self.special_tokens and pre_token in self.special_tokens:
                     sequence_of_token_ids.append(self.reverse_vocab[pre_token.encode('utf-8')])
                     continue
@@ -103,3 +132,19 @@ class Tokenizer():
             else:
                 byte_sequence += self.vocab[token_id]
         return byte_sequence.decode('utf-8', errors='replace')
+
+if __name__ == '__main__':
+    from pathlib import Path
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    vocab_path = PROJECT_ROOT / 'data/tinystories_vocab_10000.pkl'
+    merges_path = PROJECT_ROOT / 'data/tinystories_merges_10000.pkl'
+    special_tokens = ['<|endoftext|>']
+    my_tokenizer = Tokenizer.from_files(vocab_path, merges_path, special_tokens)
+
+    # Load and convert .txt to str to pass as text to encode()
+    tinystories_path = PROJECT_ROOT / "data/TinyStoriesV2-GPT4-valid.txt"
+    
+    with open(tinystories_path, 'r') as f:
+        text = f.read()
+
+    token_ids = my_tokenizer.encode(text, logging=True)

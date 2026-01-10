@@ -49,3 +49,22 @@ On validation set:
 Longest token (bytes): b'----------------------------------------------------------------'
 Length in bytes: 64
 Longest token as string: ----------------------------------------------------------------
+
+## Problem (tokenizer_experiments): Experiments with tokenizers (4 points)
+
+### (a) Sample 10 documents from TinyStories and OpenWebText. Using your previously-trained TinyStories and OpenWebText tokenizers (10K and 32K vocabulary size, respectively), encode these sampled documents into integer IDs. What is each tokenizer’s compression ratio (bytes/token)?
+
+Even using validation tiny-stories, this takes a lot of time, but trend is approaching 4.10/4.11
+
+
+### (b) What happens if you tokenize your OpenWebText sample with the TinyStories tokenizer? Compare the compression ratio and/or qualitatively describe what happens.
+
+No time for this
+
+### (c) Estimate the throughput of your tokenizer (e.g., in bytes/second). How long would it take to tokenize the Pile dataset (825GB of text)?
+
+Trend approximates 1350 bytes/second. 825GB / 1350 bytes/s = 825 * 2^30 /1350 = 7594,62 days = 20,79 years hahaha crazy
+
+### (d) Using your TinyStories and OpenWebText tokenizers, encode the respective training and development datasets into a sequence of integer token IDs. We’ll use this later to train our language model. We recommend serializing the token IDs as a NumPy array of datatype uint16. Why is uint16 an appropriate choice?
+
+Token ids are positive integers, so unsigned int makes sense. The maximum id value is vocab_size. With uint16 we get 2^16 = 65536 different values, which is appropriate for a 32000 vocab size, and would actualy be fit for a vocab size up to 65536

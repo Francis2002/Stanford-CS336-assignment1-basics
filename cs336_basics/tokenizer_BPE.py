@@ -181,6 +181,16 @@ if __name__ == "__main__":
         print(f"Longest token (bytes): {longest_token}")
         print(f"Length in bytes: {len(longest_token)}")
         print(f"Longest token as string: {longest_token.decode('utf-8', errors='replace')}")
+
+        # Save vocab and merges in pickle format, that can be loaded later
+        import pickle
+        from pathlib import Path
+        PROJECT_ROOT = Path(__file__).resolve().parent.parent
+        with open(PROJECT_ROOT / 'data/tinystories_vocab_10000.pkl', 'wb') as f:
+            pickle.dump(tiny_stories_vocab_10000, f)
+        with open(PROJECT_ROOT / 'data/tinystories_merges_10000.pkl', 'wb') as f:
+            pickle.dump(tiny_stories_merges_10000, f)
+        
     elif args.dataset == 'owt':
         owt_vocab_32000, owt_merges_32000 = train_bpe_expts_owt()
 
@@ -188,3 +198,12 @@ if __name__ == "__main__":
         print(f"Longest token (bytes): {longest_token}")
         print(f"Length in bytes: {len(longest_token)}")
         print(f"Longest token as string: {longest_token.decode('utf-8', errors='replace')}")
+
+        # Save vocab and merges in pickle format, that can be loaded later
+        import pickle
+        from pathlib import Path
+        PROJECT_ROOT = Path(__file__).resolve().parent.parent
+        with open(PROJECT_ROOT / 'data/owt_vocab_32000.pkl', 'wb') as f:
+            pickle.dump(owt_vocab_32000, f)
+        with open(PROJECT_ROOT / 'data/owt_merges_32000.pkl', 'wb') as f:
+            pickle.dump(owt_merges_32000, f)
