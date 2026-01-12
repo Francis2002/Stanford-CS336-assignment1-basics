@@ -39,4 +39,4 @@ class TransformerLM(nn.Module):
             x = block(x, rope, token_positions)
         x = self.norm(x)
         x = self.linear(x)
-        return softmax(x, dim=-1)
+        return x

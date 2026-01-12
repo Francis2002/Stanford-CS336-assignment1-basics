@@ -17,4 +17,3 @@ class SwiGLU(nn.Module):
         w3_x = self.w3(x)
         before_w2 = after_silu * w3_x
         return self.w2(before_w2)
-
