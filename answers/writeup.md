@@ -96,6 +96,8 @@ Token IDs are non-negative integers, so an unsigned integer (`uint`) makes sense
 
 ### (a) Suppose we constructed our model using this configuration. How many trainable parameters would our model have? Assuming each parameter is represented using single-precision floating point, how much memory is required to just load this model?
 
+1 head:
+
 Total Params = d_model * vocab_size + d_model + num_layers * (4 * d_model * d_model + 3 * d_model * d_ff + 2 * d_model) + vocab_size * d_model = 
 50,257 * 1,600 + 1,600 + 48 * (4 * 1,600 * 1,600 + 3 * 1,600 * 6,400 + 2 * 1,600) + 50,257 * 1,600 = 80,411,200 + 1,600 + 48 * (10,240,000 + 30,720,000 + 3,200) + 80,411,200 = 80,411,200 + 1,600 + 48 * 40,963,200 + 80,411,200 = 80,411,200 + 1,600 + 1,966,233,600 + 80,411,200 = 2,127,057,600
 
@@ -142,17 +144,20 @@ For simplicity, when calculating memory usage of activations, consider only the 
 • output embedding
 • cross-entropy on logits
 
-Deliverable: An algebraic expression for each of parameters, activations, gradients, and optimizer state, as well as the total.
+1 head:
+
+Parameters: d_model * vocab_size + d_model + num_layers * (4 * d_model * d_model + 3 * d_model * d_ff + 2 * d_model) + vocab_size * d_model
+
+... ok we know how much its going to be.
 
 ### (b) Instantiate your answer for a GPT-2 XL-shaped model to get an expression that only depends on the batch_size. What is the maximum batch size you can use and still fit within 80GB memory?
 
-Deliverable: An expression that looks like a · batch_size + b for numerical values a, b, and a
-number representing the maximum batch size.
+skip
 
 ### (c) How many FLOPs does running one step of AdamW take?
 
-Deliverable: An algebraic expression, with a brief justification.
+skip
 
 ### (d) Model FLOPs utilization (MFU) is defined as the ratio of observed throughput (tokens per second) relative to the hardware’s theoretical peak FLOP throughput [Chowdhery et al., 2022]. An NVIDIA A100 GPU has a theoretical peak of 19.5 teraFLOP/s for float32 operations. Assuming you are able to get 50% MFU, how long would it take to train a GPT-2 XL for 400K steps and a batch size of 1024 on a single A100? Following Kaplan et al. [2020] and Hoffmann et al. [2022], assume that the backward pass has twice the FLOPs of the forward pass.
 
-Deliverable: The number of days training would take, with a brief justification.
+skip

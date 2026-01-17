@@ -1,5 +1,6 @@
 from cs336_basics.bpe_utils import pre_tokenize_chunks_with_specials, split_with_specials
 from collections.abc import Iterable, Iterator, Sequence
+import pickle
 
 class Tokenizer():
 
@@ -148,3 +149,6 @@ if __name__ == '__main__':
         text = f.read()
 
     token_ids = my_tokenizer.encode(text, logging=True)
+
+    with open(PROJECT_ROOT / 'data/tinystories_token_ids_10000.pkl', 'wb') as f:
+        pickle.dump(token_ids, f)
