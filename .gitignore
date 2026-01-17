@@ -164,4 +164,3 @@ cython_debug/
 data/owt_train.txt
 data/owt_valid.txt
 data/TinyStoriesV2-GPT4-train.txt
-data/TinyStoriesV2-GPT4-valid.txt
