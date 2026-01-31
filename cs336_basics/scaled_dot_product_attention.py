@@ -18,7 +18,9 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
     qk = einops.einsum(Q, K, 'b ... seq_q d_k, b ... seq_k d_k -> b ... seq_q seq_k')
     before_softmax = qk / (d_k ** 0.5)
     if mask is not None:
-        before_softmax[mask == 0] = -float('inf')
+        # Use masked_fill instead of boolean indexing.
+        # before_softmax[mask == 0] = -float('inf') can trigger expensive copies.
+        before_softmax = before_softmax.masked_fill(~mask, float('-inf'))
     before_V = softmax(before_softmax, dim=-1)
     return einops.einsum(before_V, V, 'b ... seq_q seq_k, b ... seq_k d_v -> b ... seq_q d_v')
     

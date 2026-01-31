@@ -38,8 +38,10 @@ class MultiheadSelfAttention(nn.Module):
             q = rope(q, token_positions)
             k = rope(k, token_positions)
 
+        # Create a 2D mask (seq_len, seq_len) and broadcast.
         # this should look like [[1, 0, 0], [1, 1, 0], [1, 1, 1]]
-        mask = ~torch.ones(q.shape[:-2] + (q.shape[-2], k.shape[-2]), dtype=torch.bool, device=q.device).triu(diagonal=1)
+        seq_len = q.shape[-2]
+        mask = ~torch.ones((seq_len, seq_len), dtype=torch.bool, device=q.device).triu(diagonal=1)
 
         attention = scaled_dot_product_attention(q, k, v, mask)
 

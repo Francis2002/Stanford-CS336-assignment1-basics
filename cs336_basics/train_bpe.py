@@ -182,14 +182,20 @@ if __name__ == "__main__":
         print(f"Length in bytes: {len(longest_token)}")
         print(f"Longest token as string: {longest_token.decode('utf-8', errors='replace')}")
 
-        # Save vocab and merges in pickle format, that can be loaded later
-        import pickle
+        # Save vocab and merges in JSON format
+        import json
         from pathlib import Path
         PROJECT_ROOT = Path(__file__).resolve().parent.parent
-        with open(PROJECT_ROOT / 'data/tinystories_vocab_10000.pkl', 'wb') as f:
-            pickle.dump(tiny_stories_vocab_10000, f)
-        with open(PROJECT_ROOT / 'data/tinystories_merges_10000.pkl', 'wb') as f:
-            pickle.dump(tiny_stories_merges_10000, f)
+        
+        vocab_path = PROJECT_ROOT / 'data/tinystories_vocab_10000.json'
+        json_vocab = {str(k): list(v) for k, v in tiny_stories_vocab_10000.items()}
+        with open(vocab_path, 'w') as f:
+            json.dump(json_vocab, f, indent=2)
+            
+        merges_path = PROJECT_ROOT / 'data/tinystories_merges_10000.json'
+        json_merges = [[list(m[0]), list(m[1])] for m in tiny_stories_merges_10000]
+        with open(merges_path, 'w') as f:
+            json.dump(json_merges, f, indent=2)
         
     elif args.dataset == 'owt':
         owt_vocab_32000, owt_merges_32000 = train_bpe_expts_owt()
@@ -199,11 +205,17 @@ if __name__ == "__main__":
         print(f"Length in bytes: {len(longest_token)}")
         print(f"Longest token as string: {longest_token.decode('utf-8', errors='replace')}")
 
-        # Save vocab and merges in pickle format, that can be loaded later
-        import pickle
+        # Save vocab and merges in JSON format
+        import json
         from pathlib import Path
         PROJECT_ROOT = Path(__file__).resolve().parent.parent
-        with open(PROJECT_ROOT / 'data/owt_vocab_32000.pkl', 'wb') as f:
-            pickle.dump(owt_vocab_32000, f)
-        with open(PROJECT_ROOT / 'data/owt_merges_32000.pkl', 'wb') as f:
-            pickle.dump(owt_merges_32000, f)
+        
+        vocab_path = PROJECT_ROOT / 'data/owt_vocab_32000.json'
+        json_vocab = {str(k): list(v) for k, v in owt_vocab_32000.items()}
+        with open(vocab_path, 'w') as f:
+            json.dump(json_vocab, f, indent=2)
+            
+        merges_path = PROJECT_ROOT / 'data/owt_merges_32000.json'
+        json_merges = [[list(m[0]), list(m[1])] for m in owt_merges_32000]
+        with open(merges_path, 'w') as f:
+            json.dump(json_merges, f, indent=2)

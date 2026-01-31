@@ -28,12 +28,27 @@ class Tokenizer():
             special_tokens: list[str] | None = None
         """
         import pickle
+        import json
+        import os
 
-        with open(vocab_filepath, 'rb') as f:
-            vocab = pickle.load(f)
+        # Support both JSON and Pickle (Legacy)
+        if str(vocab_filepath).endswith('.json'):
+            with open(vocab_filepath, 'r') as f:
+                json_vocab = json.load(f)
+            # JSON keys are strings, values are lists of byte ints
+            vocab = {int(k): bytes(v) for k, v in json_vocab.items()}
+        else:
+            with open(vocab_filepath, 'rb') as f:
+                vocab = pickle.load(f)
         
-        with open(merges_filepath, 'rb') as f:
-            merges = pickle.load(f)
+        if str(merges_filepath).endswith('.json'):
+            with open(merges_filepath, 'r') as f:
+                json_merges = json.load(f)
+            # Convert list of lists of byte ints back to list of tuples of bytes
+            merges = [(bytes(m[0]), bytes(m[1])) for m in json_merges]
+        else:
+            with open(merges_filepath, 'rb') as f:
+                merges = pickle.load(f)
 
         return cls(vocab, merges, special_tokens=special_tokens)
 
@@ -136,9 +151,11 @@ class Tokenizer():
 
 if __name__ == '__main__':
     from pathlib import Path
+    import numpy as np
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
-    vocab_path = PROJECT_ROOT / 'data/tinystories_vocab_10000.pkl'
-    merges_path = PROJECT_ROOT / 'data/tinystories_merges_10000.pkl'
+    # Use JSON formats
+    vocab_path = PROJECT_ROOT / 'data/tinystories_vocab_10000.json'
+    merges_path = PROJECT_ROOT / 'data/tinystories_merges_10000.json'
     special_tokens = ['<|endoftext|>']
     my_tokenizer = Tokenizer.from_files(vocab_path, merges_path, special_tokens)
 
@@ -150,5 +167,7 @@ if __name__ == '__main__':
 
     token_ids = my_tokenizer.encode(text, logging=True)
 
-    with open(PROJECT_ROOT / 'data/tinystories_token_ids_10000.pkl', 'wb') as f:
-        pickle.dump(token_ids, f)
+    # Save as raw binary uint16 for performance
+    token_ids_path = PROJECT_ROOT / 'data/tinystories_token_ids_10000.bin'
+    np.array(token_ids, dtype=np.uint16).tofile(token_ids_path)
+    print(f"Saved {len(token_ids)} tokens to {token_ids_path}")
