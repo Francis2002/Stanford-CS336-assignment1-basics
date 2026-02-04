@@ -22,6 +22,7 @@ import uuid
 from datetime import datetime
 import os
 import time
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(
@@ -33,9 +34,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 def run_bpe_trainer(text_path, vocab_size, special_characters, use_profiler=True):
     
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
     full_text_path = PROJECT_ROOT / text_path
     vocab, merges = train_bpe(full_text_path, vocab_size, special_characters, use_profiler=use_profiler)
 
@@ -63,21 +65,26 @@ def run_bpe_trainer(text_path, vocab_size, special_characters, use_profiler=True
 
 def tokenize_data(text_path, merges_path, vocab_path, special_characters):
 
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
     full_vocab_path = PROJECT_ROOT / vocab_path
     full_merges_path = PROJECT_ROOT / merges_path
     my_tokenizer = Tokenizer.from_files(full_vocab_path, full_merges_path, special_characters)
     
-    with open(PROJECT_ROOT / text_path, 'r') as f:
-        text = f.read()
+    file_size = os.path.getsize(PROJECT_ROOT / text_path)
 
-    token_ids = my_tokenizer.encode(text, logging=True)
+    def progress_wrapper(iterable, pbar):
+        for item in iterable:
+            yield item
+            pbar.update(len(item.encode('utf-8')))
+
+    with open(PROJECT_ROOT / text_path, 'r') as f:
+        with tqdm(total=file_size, unit='B', unit_scale=True, desc=f"Tokenizing {os.path.basename(text_path)}") as pbar:
+            token_ids = list(my_tokenizer.encode_iterable(progress_wrapper(f, pbar)))
 
     # Save as raw binary .bin
-    path_tokens = PROJECT_ROOT / text_path.replace(".txt", f"_{len(my_tokenizer.vocab)}.bin")
+    path_tokens = PROJECT_ROOT / text_path.replace(".txt", f"_token_ids_{len(my_tokenizer.vocab)}.bin")
     np.array(token_ids, dtype=np.uint16).tofile(path_tokens)
 
-    return path_tokens
+    return str(path_tokens)
 
 if __name__ == "__main__":
     # Parse args
@@ -109,12 +116,12 @@ if __name__ == "__main__":
     # Rope
     parser.add_argument("--rope_theta", type=int, default=10000)
     # Training paths
-    parser.add_argument("--train_path_tokens", type=str, default="./data/tinystories_token_ids_10000.bin")
-    parser.add_argument("--val_path_tokens", type=str, default="./data/tinystories_token_ids_10000.bin")
-    parser.add_argument("--train_path_text", type=str, default="./data/TinyStoriesV2-GPT4-valid.txt")
+    parser.add_argument("--train_path_tokens", type=str, default=None)
+    parser.add_argument("--val_path_tokens", type=str, default=None)
+    parser.add_argument("--train_path_text", type=str, default="./data/TinyStoriesV2-GPT4-train.txt")
     parser.add_argument("--val_path_text", type=str, default="./data/TinyStoriesV2-GPT4-valid.txt")
-    parser.add_argument("--vocab_path", type=str, default="./data/tinystories_vocab_10000.json")
-    parser.add_argument("--merges_path", type=str, default="./data/tinystories_merges_10000.json")
+    parser.add_argument("--vocab_path", type=str, default=None)
+    parser.add_argument("--merges_path", type=str, default=None)
     parser.add_argument("--print_every", type=int, default=250)
     parser.add_argument("--log_dir", type=str, default="./logs")
     # Checkpoint paths
@@ -139,17 +146,47 @@ if __name__ == "__main__":
 
     # Tokenize data if needed
     if args.train_path_tokens is None:
-        print("No token path provided. Tokenizing the training data...")
-        if args.vocab_path is None or args.merges_path is None:
-            print("No vocab path or merges path provided. We will train BPE from scratch.")
-            vocab_path, merges_path = run_bpe_trainer(args.train_path_text, args.vocab_size, args.special_characters, use_profiler)
-            args.vocab_path = vocab_path # update these so that for val we already have it
-            args.merges_path = merges_path
-        args.train_path_tokens = tokenize_data(args.train_path_text, args.merges_path, args.vocab_path, args.special_characters)
+        print("No token path provided. Checking if token path with same name as text path exists...")
+        print(f"Checking for token path: {PROJECT_ROOT / args.train_path_text.replace(".txt", f"_token_ids_{args.vocab_size}.bin")}")
+
+        possible_train_token_path = PROJECT_ROOT / args.train_path_text.replace(".txt", f"_token_ids_{args.vocab_size}.bin")
+        if possible_train_token_path.exists():
+            args.train_path_tokens = str(possible_train_token_path)
+            print(f"Found token path: {args.train_path_tokens}")
+        else:
+            print("No token path provided. Tokenizing the training data...")
+        
+            if args.vocab_path is None or args.merges_path is None:
+                print("No vocab path or merges path provided. Checking if vocab and merges paths with same name as text path exist...")
+                print(f"Checking for merges path: {PROJECT_ROOT / args.train_path_text.replace(".txt", f"_merges_{args.vocab_size}.json")}")
+                print(f"Checking for vocab path: {PROJECT_ROOT / args.train_path_text.replace(".txt", f"_vocab_{args.vocab_size}.json")}")
+
+                possible_train_merges_path = PROJECT_ROOT / args.train_path_text.replace(".txt", f"_merges_{args.vocab_size}.json")
+                possible_train_vocab_path = PROJECT_ROOT / args.train_path_text.replace(".txt", f"_vocab_{args.vocab_size}.json")
+
+                if possible_train_merges_path.exists() and possible_train_vocab_path.exists():
+                    args.merges_path = str(possible_train_merges_path)
+                    args.vocab_path = str(possible_train_vocab_path)
+                    print(f"Found merges path: {args.merges_path}")
+                    print(f"Found vocab path: {args.vocab_path}")
+                else:
+                    print("No vocab path or merges path provided. We will train BPE from scratch.")
+                    vocab_path, merges_path = run_bpe_trainer(args.train_path_text, args.vocab_size, args.special_characters, args.use_profiler)
+                    args.vocab_path = vocab_path # update these so that for val we already have it
+                    args.merges_path = merges_path
+            args.train_path_tokens = tokenize_data(args.train_path_text, args.merges_path, args.vocab_path, args.special_characters)
     
     if args.val_path_tokens is None:
-        print("No token path provided. Tokenizing the validation data...")
-        args.val_path_tokens = tokenize_data(args.val_path_text, args.merges_path, args.vocab_path, args.special_characters)
+        print("No token path provided. Checking if token path with same name as text path exists...")
+        print(f"Checking for token path: {PROJECT_ROOT / args.val_path_text.replace(".txt", f"_token_ids_{args.vocab_size}.bin")}")
+
+        possible_val_token_path = PROJECT_ROOT / args.val_path_text.replace(".txt", f"_token_ids_{args.vocab_size}.bin")
+        if possible_val_token_path.exists():
+            args.val_path_tokens = str(possible_val_token_path)
+            print(f"Found token path: {args.val_path_tokens}")
+        else:
+            print("No token path provided. Tokenizing the validation data...")
+            args.val_path_tokens = tokenize_data(args.val_path_text, args.merges_path, args.vocab_path, args.special_characters)
 
     # Load data efficiently with np.memmap
     train_data = np.memmap(args.train_path_tokens, dtype=np.uint16, mode="r")
@@ -201,7 +238,7 @@ if __name__ == "__main__":
     # Initialize Rope
     rope = RotaryPositionalEmbedding(args.rope_theta, args.d_model // args.num_heads, args.context_length, device=device)
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     
     # Training Loop
     for step in range(iteration, args.num_steps + 1):
@@ -232,7 +269,7 @@ if __name__ == "__main__":
         # Log metrics every step (streaming to JSONL)
         metrics = {
             "step": step,
-            "wall_time": time.time() - start_time,
+            "wall_time": time.perf_counter() - start_time,
             "train_loss": loss.item(),
             "val_loss": val_loss.item(),
             "lr": lr,

@@ -155,7 +155,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], use_p
 def train_bpe_tinystories():
     from pathlib import Path
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
-    tinystories_path = PROJECT_ROOT / "data/TinyStoriesV2-GPT4-valid.txt"
+    tinystories_path = PROJECT_ROOT / "data/TinyStoriesV2-GPT4-train.txt"
     vocab_size = 10000
     special_characters = ['<|endoftext|>']
     return train_bpe(tinystories_path, vocab_size, special_characters, use_profiler=True)
@@ -163,7 +163,7 @@ def train_bpe_tinystories():
 def train_bpe_expts_owt():
     from pathlib import Path
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
-    tinystories_path = PROJECT_ROOT / "data/owt_valid.txt"
+    tinystories_path = PROJECT_ROOT / "data/owt_train.txt"
     vocab_size = 32000
     special_characters = ['<|endoftext|>']
     return train_bpe(tinystories_path, vocab_size, special_characters, use_profiler=True)
