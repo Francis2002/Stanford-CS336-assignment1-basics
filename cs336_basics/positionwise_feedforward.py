@@ -12,8 +12,5 @@ class SwiGLU(nn.Module):
         self.w3 = Linear(d_model, d_ff, device, dtype)
 
     def forward(self, x):
-        w1_x = self.w1(x)
-        after_silu = silu_activation(w1_x)
-        w3_x = self.w3(x)
-        before_w2 = after_silu * w3_x
-        return self.w2(before_w2)
+        # Combining operations avoids storing named intermediate tensors in the local scope
+        return self.w2(silu_activation(self.w1(x)) * self.w3(x))

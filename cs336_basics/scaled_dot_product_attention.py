@@ -14,13 +14,12 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
     to 1, and the attention probabilities of positions with a mask value of False should be zero.
     """
     d_k = Q.shape[-1]
-
+ 
     qk = einops.einsum(Q, K, 'b ... seq_q d_k, b ... seq_k d_k -> b ... seq_q seq_k')
-    before_softmax = qk / (d_k ** 0.5)
-    if mask is not None:
-        # Use masked_fill instead of boolean indexing.
-        # before_softmax[mask == 0] = -float('inf') can trigger expensive copies.
-        before_softmax = before_softmax.masked_fill(~mask, float('-inf'))
-    before_V = softmax(before_softmax, dim=-1)
-    return einops.einsum(before_V, V, 'b ... seq_q seq_k, b ... seq_k d_v -> b ... seq_q d_v')
     
+    qk = qk / (d_k ** 0.5)
+    if mask is not None:
+        qk = qk.masked_fill(~mask, float('-inf'))
+        
+    attn_probs = softmax(qk, dim=-1)
+    return einops.einsum(attn_probs, V, 'b ... seq_q seq_k, b ... seq_k d_v -> b ... seq_q d_v')

@@ -26,7 +26,7 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(d_model, device=device, dtype=dtype)
 
     def forward(self, x, rope=None, token_positions=None):
-        x = x + self.attention(self.norm1(x), rope, token_positions) # (Norm -> Attn) + residual
-        x = x + self.feed_forward(self.norm2(x)) # (Norm -> FF) + residual
+        x = x + self.attention(self.norm1(x), rope, token_positions)
+        x = x + self.feed_forward(self.norm2(x))
         return x
         

@@ -102,7 +102,7 @@ if __name__ == "__main__":
     parser.add_argument("--steps_for_warmup", type=int, default=0)
     parser.add_argument("--steps_for_cosine", type=int, default=5000)
     # Optimizer hyperparameters
-    parser.add_argument("--batch_size", type=int, default=32) # Aim for batch_size * num_steps * context_length = 327_680_000 total tokens processed on GPU or 40_000_000 on CPU
+    parser.add_argument("--batch_size", type=int, default=256) # Aim for batch_size * num_steps * context_length = 327_680_000 total tokens processed on GPU or 40_000_000 on CPU
     parser.add_argument("--num_steps", type=int, default=5000) # iteration starts at 1 for convenience
     parser.add_argument("--max_grad_norm", type=float, default=None)
     parser.add_argument("--beta1", type=float, default=0.9)
@@ -281,9 +281,17 @@ if __name__ == "__main__":
             logger.info(f"Step {step}/{args.num_steps} - Train Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}")
 
         if step % args.save_every == 0:
+            # Clear CUDA cache before checkpointing to ensure contiguous memory for saving
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             checkpoint_path = os.path.join(RUN_DIR, f"checkpoint_{step:06d}.pt")
             save_checkpoint(model, optimizer, step, checkpoint_path, config=vars(args))
             logger.info(f"Saved checkpoint to {checkpoint_path}")
+
+        # Surgical memory cleanup: Force immediate release of large tensors to prevent "Peak Overlap" 
+        # and fragmentation. This keeps memory usage strictly bounded per iteration.
+        del x, y, y_pred, loss
+        del x_val, y_val, y_pred_val, val_loss
 
     logger.info("Training complete.")
         
