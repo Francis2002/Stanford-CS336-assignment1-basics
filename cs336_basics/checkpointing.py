@@ -7,17 +7,14 @@ logger = logging.getLogger(__name__)
 
 def save_checkpoint(model, optimizer, iteration, out, config=None):
     """
-    should dump all the state from the
-    first three parameters into the file-like object out. You can use the state_dict method of both
-    the model and the optimizer to get their relevant states and use torch.save(obj, out) to dump
-    obj into out (PyTorch supports either a path or a file-like object here). A typical choice is to
-    have obj be a dictionary, but you can use whatever format you want as long as you can load your
-    checkpoint later.
-    This function expects the following parameters:
-    model: torch.nn.Module
-    optimizer: torch.optim.Optimizer
-    iteration: int
-    out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]
+    Safely saves the model and optimizer states via atomic write.
+    
+    Args:
+        model (nn.Module): The model to save.
+        optimizer (optim.Optimizer): The optimizer state.
+        iteration (int): Current training step.
+        out (str | PathLike): Destination file path.
+        config (dict, optional): Run configuration to save alongside the checkpoint.
     """
     out_dir = os.path.dirname(out)
     if out_dir:
@@ -26,8 +23,8 @@ def save_checkpoint(model, optimizer, iteration, out, config=None):
     temp_path = str(out) + ".tmp"
     
     checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
+        'model_state_dict': model.state_dict() if hasattr(model, 'state_dict') else model,
+        'optimizer_state_dict': optimizer.state_dict() if hasattr(optimizer, 'state_dict') else optimizer,
         'iteration': iteration
     }
     
@@ -43,7 +40,7 @@ def save_checkpoint(model, optimizer, iteration, out, config=None):
                 json.dump(config, f, indent=2)
             logger.info(f"Saved run configuration to {config_path}")
 
-def load_checkpoint(src, model, optimizer):
+def load_checkpoint(src, model, optimizer=None, device=None, prefix="_orig_mod."):
     """
     should load a checkpoint from src (path or file-
     like object), and then recover the model and optimizer states from that checkpoint. Your
@@ -55,8 +52,15 @@ def load_checkpoint(src, model, optimizer):
     src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]
     model: torch.nn.Module
     optimizer: torch.optim.Optimizer
+        device: torch.device
+    prefix: str
     """
-    checkpoint = torch.load(src)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    checkpoint = torch.load(src, map_location=device)
+
+    # Strip "_orig_mod." prefix added by torch.compile() if present
+    state_dict = checkpoint['model_state_dict']
+    state_dict = {k.removeprefix(prefix): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     return checkpoint['iteration']

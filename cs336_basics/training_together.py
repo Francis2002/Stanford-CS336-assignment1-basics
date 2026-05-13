@@ -1,12 +1,18 @@
 import torch
 import argparse
 import numpy as np
+import os
+
+# Set CUDA allocator configuration to handle fragmentation more gracefully.
+# 'expandable_segments:True' allows the allocator to use more flexible segment management.
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from cs336_basics.tokenizer import Tokenizer
 from cs336_basics.train_bpe import train_bpe
 
 from cs336_basics.transformer_lm import TransformerLM
-from cs336_basics.data_loading import load_data
+from cs336_basics.data_loading import load_data, TokenDataset
+from torch.utils.data import DataLoader
 from cs336_basics.checkpointing import save_checkpoint, load_checkpoint
 from cs336_basics.adamw import AdamW
 from cs336_basics.gradient_clipping import gradient_clipping
@@ -23,6 +29,7 @@ from datetime import datetime
 import os
 import time
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logging.basicConfig(
@@ -100,11 +107,11 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate_base", type=float, default=1e-3)
     parser.add_argument("--learning_rate_min", type=float, default=1e-5)
     parser.add_argument("--steps_for_warmup", type=int, default=0)
-    parser.add_argument("--steps_for_cosine", type=int, default=5000)
+    parser.add_argument("--steps_for_cosine", type=int, default=40000)
     # Optimizer hyperparameters
-    parser.add_argument("--batch_size", type=int, default=256) # Aim for batch_size * num_steps * context_length = 327_680_000 total tokens processed on GPU or 40_000_000 on CPU
-    parser.add_argument("--num_steps", type=int, default=5000) # iteration starts at 1 for convenience
-    parser.add_argument("--max_grad_norm", type=float, default=None)
+    parser.add_argument("--batch_size", type=int, default=32) # Assignment: batch_size * num_steps * context_length = 327_680_000 total tokens processed on GPU or 40_000_000 on CPU
+    parser.add_argument("--num_steps", type=int, default=40000) # iteration starts at 1 for convenience
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--epsilon", type=float, default=1e-8)
@@ -118,8 +125,8 @@ if __name__ == "__main__":
     # Training paths
     parser.add_argument("--train_path_tokens", type=str, default=None)
     parser.add_argument("--val_path_tokens", type=str, default=None)
-    parser.add_argument("--train_path_text", type=str, default="./data/TinyStoriesV2-GPT4-train.txt")
-    parser.add_argument("--val_path_text", type=str, default="./data/TinyStoriesV2-GPT4-valid.txt")
+    parser.add_argument("--train_path_text", type=str, default="./data/owt_train.txt")
+    parser.add_argument("--val_path_text", type=str, default="./data/owt_valid.txt")
     parser.add_argument("--vocab_path", type=str, default=None)
     parser.add_argument("--merges_path", type=str, default=None)
     parser.add_argument("--print_every", type=int, default=250)
@@ -128,6 +135,10 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--load_path", type=str, default=None)
     parser.add_argument("--save_every", type=int, default=250)
+    parser.add_argument("--keep_last", type=int, default=3, help="Number of checkpoints to retain. -1 to keep all.")
+    # Extensions
+    parser.add_argument("--mixed_precision", action="store_true", help="Enable FP16/BF16 training")
+    parser.add_argument("--async_io", action="store_true", help="Enable asynchronous logging and checkpointing")
     # Device
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
@@ -196,14 +207,46 @@ if __name__ == "__main__":
     model = TransformerLM(args.vocab_size, args.context_length, args.num_layers, args.d_model, args.num_heads, args.d_ff, device=device)
     model.to(device)
 
+    # Torch Compile (Fused Kernels), kinda like jit
+    if device.type == "cuda":
+        logger.info("Compiling model (torch.compile)...")
+        model = torch.compile(model)
+
     # Load optimizer
     optimizer = AdamW(model.parameters(), lr=args.learning_rate_base, betas=(args.beta1, args.beta2), eps=args.epsilon, weight_decay=args.weight_decay)
 
     # Load checkpoint
     if args.load_path is not None:
-        iteration = load_checkpoint(args.load_path, model, optimizer)
+        iteration = load_checkpoint(args.load_path, model, optimizer, device=device)
     else:
         iteration = 1
+
+    # Parallel Data Loading
+    train_dataset = TokenDataset(train_data, args.context_length)
+    val_dataset = TokenDataset(val_data, args.context_length)
+    
+    # Workers for speedup
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        num_workers=4, 
+        pin_memory=(device.type == "cuda")
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size, 
+        num_workers=4, 
+        pin_memory=(device.type == "cuda")
+    )
+    
+    train_iter = iter(train_loader)
+    val_iter = iter(val_loader)
+
+    # Mixed Precision Setup
+    scaler = torch.amp.GradScaler("cuda") if args.mixed_precision and device.type == "cuda" else None
+
+    # Async I/O uses 1 thread for saving checkpoints/metrics to avoid halting the main thread
+    executor = ThreadPoolExecutor(max_workers=1) if args.async_io else None
 
     # Experiment naming with slugs
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -245,28 +288,58 @@ if __name__ == "__main__":
         
         # Training
         optimizer.zero_grad()
-        x, y = load_data(train_data, args.batch_size, args.context_length, args.device)
-        y_pred = model(x, rope=rope)
-        loss = cross_entropy(y_pred, y)
-        loss.backward()
+        
+        # Pull next batch from background workers
+        try:
+            x, y = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            x, y = next(train_iter)
+            
+        x, y = x.to(device), y.to(device)
 
-        if args.max_grad_norm is not None:
-            gradient_clipping(model.parameters(), args.max_grad_norm)
+        # Mixed Precision Forward Pass
+        # autocast allows matmuls to run in float16/bf16 for speed and memory savings
+        with torch.amp.autocast("cuda", enabled=(args.mixed_precision and device.type == "cuda")):
+            y_pred = model(x, rope=rope)
+            loss = cross_entropy(y_pred, y)
+
+        if scaler:
+            # Scale loss by the scaler factor to prevent gradients from underflowing in float16.
+            # Then unscale them before the optimizer step so that the math stays correct
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if args.max_grad_norm is not None:
+                gradient_clipping(model.parameters(), args.max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+
+            if args.max_grad_norm is not None:
+                gradient_clipping(model.parameters(), args.max_grad_norm)
+            optimizer.step()
 
         lr = learning_rate_schedule(step, args.learning_rate_base, args.learning_rate_min, args.steps_for_warmup, args.steps_for_cosine)
         
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        optimizer.step()
-
         # Validation
         with torch.no_grad():
-            x_val, y_val = load_data(val_data, args.batch_size, args.context_length, args.device)
-            y_pred_val = model(x_val, rope=rope)
-            val_loss = cross_entropy(y_pred_val, y_val)
+            try:
+                x_val, y_val = next(val_iter)
+            except StopIteration:
+                val_iter = iter(val_loader)
+                x_val, y_val = next(val_iter)
+            
+            x_val, y_val = x_val.to(device), y_val.to(device)
+            
+            with torch.amp.autocast("cuda", enabled=(args.mixed_precision and device.type == "cuda")):
+                y_pred_val = model(x_val, rope=rope)
+                val_loss = cross_entropy(y_pred_val, y_val)
 
-        # Log metrics every step (streaming to JSONL)
+        # Log metrics every step (streaming to JSONL), with asynchronous logging
         metrics = {
             "step": step,
             "wall_time": time.perf_counter() - start_time,
@@ -274,8 +347,15 @@ if __name__ == "__main__":
             "val_loss": val_loss.item(),
             "lr": lr,
         }
-        with open(metrics_path, "a") as f:
-            f.write(json.dumps(metrics) + "\n")
+        
+        def save_metrics(path, data):
+            with open(path, "a") as f:
+                f.write(json.dumps(data) + "\n")
+
+        if executor:
+            executor.submit(save_metrics, metrics_path, metrics)
+        else:
+            save_metrics(metrics_path, metrics)
 
         if step % args.print_every == 0:
             logger.info(f"Step {step}/{args.num_steps} - Train Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}")
@@ -285,14 +365,36 @@ if __name__ == "__main__":
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             checkpoint_path = os.path.join(RUN_DIR, f"checkpoint_{step:06d}.pt")
-            save_checkpoint(model, optimizer, step, checkpoint_path, config=vars(args))
-            logger.info(f"Saved checkpoint to {checkpoint_path}")
+            
+            # Asynchronous Checkpointing
+            if executor:
+                # We need to deepcopy the state dict, because it yields references to the live model weights, 
+                # and so the next iteration might change them in the next step while the executor thread is still writing them
+                model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                optim_state = pickle.loads(pickle.dumps(optimizer.state_dict())) # Deep copy
+                executor.submit(save_checkpoint, model_state, optim_state, step, checkpoint_path, config=vars(args))
+                logger.info(f"Started async checkpoint save to {checkpoint_path}")
+            else:
+                save_checkpoint(model, optimizer, step, checkpoint_path, config=vars(args))
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-        # Surgical memory cleanup: Force immediate release of large tensors to prevent "Peak Overlap" 
-        # and fragmentation. This keeps memory usage strictly bounded per iteration.
+            # Checkpoint Rotation
+            if args.keep_last != -1:
+                # Rotation logic: keep only the last N checkpoints
+                ckpt_files = sorted([f for f in os.listdir(RUN_DIR) if f.startswith("checkpoint_") and f.endswith(".pt")])
+                if len(ckpt_files) > args.keep_last:
+                    for old_ckpt in ckpt_files[:-args.keep_last]:
+                        os.remove(os.path.join(RUN_DIR, old_ckpt))
+                        logger.info(f"Deleted old checkpoint {old_ckpt} (Rotation policy)")
+
+        # Explicitly delete large tensor graphs before the next iteration.
+        # This prevents PyTorch's allocator from experiencing peak overlap, 
+        # when allocating the forward pass of step N+1 while the backward pass graphs of step N are still in scope
         del x, y, y_pred, loss
         del x_val, y_val, y_pred_val, val_loss
 
+    if executor:
+        executor.shutdown(wait=True)
     logger.info("Training complete.")
         
                         

@@ -1,4 +1,4 @@
-from cs336_basics.bpe_utils import pre_tokenize_chunks_with_specials, split_with_specials
+from cs336_basics.bpe_utils import pretokenize_with_special_tokens
 from collections.abc import Iterable, Iterator, Sequence
 from functools import lru_cache
 import pickle
@@ -23,12 +23,7 @@ class Tokenizer():
     @classmethod
     def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
         """
-            Class method that constructs and return a Tokenizer from a serialized vocabulary and list of merges
-            (in the same format that your BPE training code output) and (optionally) a list of special
-            tokens. This method should accept the following additional parameters:
-            vocab_filepath: str
-            merges_filepath: str
-            special_tokens: list[str] | None = None
+        Instantiates a Tokenizer from already serialized vocabulary and merge rules.
         """
         import pickle
         import json
@@ -58,68 +53,75 @@ class Tokenizer():
     # 16384 because it is a power of 2 and it is a common cache size for LRU caches
     @lru_cache(maxsize=16384)
     def _encode_word(self, word: bytes) -> list[int]:
-        # Initial state: list of single-byte token IDs
-        word_token_ids = [self.reverse_vocab[bytes([b])] for b in word]
-        
-        while len(word_token_ids) >= 2:
-            # Find all possible merges and their ranks
-            pairs = []
-            for i in range(len(word_token_ids) - 1):
-                pair = (self.vocab[word_token_ids[i]], self.vocab[word_token_ids[i+1]])
+        """Apply BPE merges to a single pre-tokenized word.
+
+        Starts with one token per byte, then repeatedly applies the
+        highest-priority (lowest-rank) available merge until no more apply.
+        """
+        # Start: each byte is its own token
+        ids = [self.reverse_vocab[bytes([b])] for b in word]
+
+        while len(ids) >= 2:
+            # Find all mergeable adjacent pairs and their priorities
+            best_rank = None
+            best_idx = None
+            for i in range(len(ids) - 1):
+                pair = (self.vocab[ids[i]], self.vocab[ids[i + 1]])
                 if pair in self.merge_ranks:
-                    pairs.append((self.merge_ranks[pair], i))
-            
-            if not pairs:
-                break
-                
-            # Perform the highest priority merge (lowest rank)
-            best_rank, best_index = min(pairs)
-            
-            p1 = self.vocab[word_token_ids[best_index]]
-            p2 = self.vocab[word_token_ids[best_index + 1]]
-            new_id = self.reverse_vocab[p1 + p2]
-            
-            # Create new list with merged token
-            new_ids = word_token_ids[:best_index] + [new_id] + word_token_ids[best_index + 2:]
-            word_token_ids = new_ids
-            
-        return word_token_ids
+                    rank = self.merge_ranks[pair]
+                    if best_rank is None or rank < best_rank:
+                        best_rank = rank
+                        best_idx = i
+
+            if best_idx is None:
+                break  # No more merges possible
+
+            # Perform the best merge
+            merged_bytes = self.vocab[ids[best_idx]] + self.vocab[ids[best_idx + 1]]
+            merged_id = self.reverse_vocab[merged_bytes]
+            ids = ids[:best_idx] + [merged_id] + ids[best_idx + 2:]
+
+        return ids
 
     def encode(self, text: str, logging=False) -> list[int]:
         """
-            Encode an input text into a sequence of token IDs.
-        """
+        Encode a string into a sequence of token IDs.
 
+        Data Transformation Pipeline:
+        1. str               : "Hello, <|endoftext|> world!"
+        2. list[str]         : ["Hello, ", "<|endoftext|>", " world!"]                 (Split by specials)
+        3. list[str]         : ["Hello", ",", " <|endoftext|>", " world", "!"]         (Pre-tokenized via Regex)
+        4. bytes             : b"Hello" -> b"H", b"e", b"l", b"l", b"o"                (UTF-8 encoding per word)
+        5. list[int]         : [40, 69, 76, 76, 79] -> [12053]
+        
+        """
         if logging:
             import time
-            start_time = time.perf_counter()
-            print("Started encoding")
+            t0 = time.perf_counter()
+            print("Started encoding...")
 
-        # Split text into chunks with specials in between like ['hello, I', '<special>', 'would not', ...]
-        chunks = split_with_specials(text, self.special_tokens)
-        chunks = pre_tokenize_chunks_with_specials(chunks, self.special_tokens)
+        # Split on special tokens and apply GPT-2 PAT regex
+        pre_tokens = pretokenize_with_special_tokens(text, self.special_tokens)
 
         if logging:
-            print("Pretokenization complete")
-            total_pre_tokens = sum(
-                len(chunk) if isinstance(chunk, Sequence) else 1
-                for chunk in chunks
-            )
-            print(f"Number of pre_tokens: {total_pre_tokens}")
-            pre_token_cnt = -1
+            print(f"Pre-tokenization: {len(pre_tokens)} pre-tokens "
+                  f"({time.perf_counter() - t0:.3f}s)")
 
-        sequence_of_token_ids = []
-        for chunk in chunks:
-            for pre_token in chunk:
-                if self.special_tokens and pre_token in self.special_tokens:
-                    sequence_of_token_ids.append(self.reverse_vocab[pre_token.encode('utf-8')])
-                    continue
-                
-                # Use cached word-level encoding
-                word_bytes = pre_token.encode('utf-8')
-                sequence_of_token_ids.extend(self._encode_word(word_bytes))
+        # Encode each pre-token
+        token_ids = []
+        for pre_token in pre_tokens:
+            if self.special_tokens and pre_token in self.special_tokens:
+                # Special token => single ID, no BPE merging
+                token_ids.append(self.reverse_vocab[pre_token.encode('utf-8')])
+            else:
+                # Regular word => apply BPE merges
+                token_ids.extend(self._encode_word(pre_token.encode('utf-8')))
 
-        return sequence_of_token_ids
+        if logging:
+            print(f"Encoding done: {len(token_ids)} token IDs "
+                  f"({time.perf_counter() - t0:.3f}s)")
+
+        return token_ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         """
@@ -137,14 +139,10 @@ class Tokenizer():
         """
         if not ids:
             return ''
-
-        byte_sequence = bytearray()
+        byte_seq = bytearray()
         for token_id in ids:
-            if byte_sequence is None:
-                byte_sequence = self.vocab[token_id] # First case
-            else:
-                byte_sequence += self.vocab[token_id]
-        return byte_sequence.decode('utf-8', errors='replace')
+            byte_seq += self.vocab[token_id]
+        return byte_seq.decode('utf-8', errors='replace')
 
 if __name__ == '__main__':
     from pathlib import Path
