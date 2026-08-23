@@ -1,0 +1,459 @@
+Done. I deliberately kept both Markdown files almost empty: headings, tables, figure slots, sample slots, and nothing pretending to be your analysis.
+
+[Download the complete artifact bundle](sandbox:/mnt/data/cs336_assignment1_artifact.zip)
+
+Individual files: [README.md](sandbox:/mnt/data/cs336_assignment1_artifact/README.md), [REPORT.md](sandbox:/mnt/data/cs336_assignment1_artifact/REPORT.md), and [run_experiments.sh](sandbox:/mnt/data/cs336_assignment1_artifact/scripts/run_experiments.sh).
+
+The experiment script implements the reduced plan we settled on: systems optimization stack, TinyStories LR sweep, batch sweep, context sweep, one full TinyStories run, a three-point TinyStories→OWT LR transfer test, and one full OWT run. It uses the assignment's 40.96M-token low-resource budget for short experiments and 327.68M tokens for full runs.  It also automatically selects the best short-run LR from the final validation loss, so you do not have to manually edit the script between the LR sweep and subsequent runs.
+
+## Exact changes I would make to `training_together.py`
+
+These are changes to the script you uploaded, not a replacement script. 
+
+1. **Add the missing experiment-control arguments.**
+
+```python
+# Experiment control
+parser.add_argument("--run_name", type=str, default=None)
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--compile", action="store_true")
+parser.add_argument("--num_workers", type=int, default=4)
+
+# Evaluation
+parser.add_argument("--eval_every", type=int, default=250)
+parser.add_argument("--eval_batches", type=int, default=20)
+```
+
+Add this import:
+
+```python
+import random
+```
+
+Immediately after parsing the arguments, seed everything:
+
+```python
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(args.seed)
+```
+
+This is necessary if the curves are going into a public experimental report.
+
+2. **Make `torch.compile` optional instead of always enabling it on CUDA.**
+
+Replace:
+
+```python
+if device.type == "cuda":
+    logger.info("Compiling model (torch.compile)...")
+    model = torch.compile(model)
+```
+
+with:
+
+```python
+if args.compile and device.type == "cuda":
+    logger.info("Compiling model (torch.compile)...")
+    model = torch.compile(model)
+```
+
+Without this change, you literally cannot run the compile vs non-compile comparison.
+
+3. **Fix the learning-rate scheduling order. This is the most important correctness change.**
+
+Right now, your script performs the optimizer update and **then** calculates the LR for that step. Therefore the first optimizer update uses `learning_rate_base` even when warmup is enabled. 
+
+Move this block:
+
+```python
+lr = learning_rate_schedule(
+    step,
+    args.learning_rate_base,
+    args.learning_rate_min,
+    args.steps_for_warmup,
+    args.steps_for_cosine,
+)
+
+for param_group in optimizer.param_groups:
+    param_group["lr"] = lr
+```
+
+from **after** `optimizer.step()` / `scaler.step()` to immediately after:
+
+```python
+optimizer.zero_grad()
+```
+
+So the order becomes:
+
+```python
+optimizer.zero_grad()
+
+lr = learning_rate_schedule(
+    step,
+    args.learning_rate_base,
+    args.learning_rate_min,
+    args.steps_for_warmup,
+    args.steps_for_cosine,
+)
+
+for param_group in optimizer.param_groups:
+    param_group["lr"] = lr
+
+# forward
+# backward
+# optimizer step
+```
+
+Delete the old LR-update block from below the optimizer step.
+
+4. **Stop doing a validation forward pass after every training step.**
+
+Your current loop essentially does:
+
+```python
+train forward
+train backward
+optimizer step
+validation forward
+```
+
+on **every iteration**. 
+
+That wastes a large amount of runtime and makes your systems measurements misleading.
+
+Use the configured number of DataLoader workers:
+
+```python
+train_generator = torch.Generator()
+train_generator.manual_seed(args.seed)
+
+val_generator = torch.Generator()
+val_generator.manual_seed(args.seed + 1)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=args.batch_size,
+    num_workers=args.num_workers,
+    pin_memory=(device.type == "cuda"),
+    persistent_workers=(args.num_workers > 0),
+    generator=train_generator,
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=args.batch_size,
+    num_workers=args.num_workers,
+    pin_memory=(device.type == "cuda"),
+    persistent_workers=(args.num_workers > 0),
+    generator=val_generator,
+)
+```
+
+Then, before training, construct a fixed validation set once:
+
+```python
+fixed_val_batches = []
+fixed_val_iter = iter(val_loader)
+
+for _ in range(args.eval_batches):
+    try:
+        batch = next(fixed_val_iter)
+    except StopIteration:
+        fixed_val_iter = iter(val_loader)
+        batch = next(fixed_val_iter)
+
+    fixed_val_batches.append(batch)
+```
+
+Add:
+
+```python
+def evaluate():
+    model.eval()
+    losses = []
+
+    with torch.no_grad():
+        for x_val, y_val in fixed_val_batches:
+            x_val = x_val.to(
+                device,
+                non_blocking=(device.type == "cuda"),
+            )
+            y_val = y_val.to(
+                device,
+                non_blocking=(device.type == "cuda"),
+            )
+
+            with torch.amp.autocast(
+                "cuda",
+                enabled=(args.mixed_precision and device.type == "cuda"),
+            ):
+                y_pred_val = model(x_val, rope=rope)
+                batch_loss = cross_entropy(y_pred_val, y_val)
+
+            losses.append(batch_loss.item())
+
+    model.train()
+    return float(np.mean(losses))
+```
+
+Delete the existing one-batch validation block inside every iteration.
+
+Replace it with:
+
+```python
+val_loss = None
+
+if (
+    step == 1
+    or step % args.eval_every == 0
+    or step == args.num_steps
+):
+    val_loss = evaluate()
+```
+
+This also means all models are evaluated on exactly the same validation batches, which makes the sweeps much cleaner.
+
+5. **Make the GPU transfers actually use pinned-memory asynchronous copies.**
+
+Replace:
+
+```python
+x, y = x.to(device), y.to(device)
+```
+
+with:
+
+```python
+x = x.to(
+    device,
+    non_blocking=(device.type == "cuda"),
+)
+y = y.to(
+    device,
+    non_blocking=(device.type == "cuda"),
+)
+```
+
+The same change is already included above for validation.
+
+6. **Log tokens and actual training throughput, not just step number.**
+
+Before the loop:
+
+```python
+throughputs = []
+
+if device.type == "cuda":
+    torch.cuda.reset_peak_memory_stats(device)
+```
+
+At the very beginning of every iteration, before fetching the training batch:
+
+```python
+if device.type == "cuda":
+    torch.cuda.synchronize()
+
+step_start = time.perf_counter()
+```
+
+Immediately after the optimizer update:
+
+```python
+if device.type == "cuda":
+    torch.cuda.synchronize()
+
+step_time = time.perf_counter() - step_start
+
+tokens_this_step = args.batch_size * args.context_length
+tokens_seen = step * tokens_this_step
+tokens_per_sec = tokens_this_step / step_time
+
+throughputs.append(tokens_per_sec)
+```
+
+Change the metrics dictionary to:
+
+```python
+metrics = {
+    "step": step,
+    "tokens_seen": tokens_seen,
+    "wall_time": time.perf_counter() - start_time,
+    "step_time": step_time,
+    "tokens_per_sec": tokens_per_sec,
+    "train_loss": loss.item(),
+    "val_loss": val_loss,
+    "lr": lr,
+}
+```
+
+This gives you the x-axis you actually want for the research plots:
+
+```text
+validation loss vs tokens_seen
+```
+
+and the value you want for the systems plots:
+
+```text
+tokens_per_sec
+```
+
+7. **Give runs deterministic names and save the complete config inside each run.**
+
+Replace:
+
+```python
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_slug = f"{timestamp}_{uuid.uuid4().hex[:4]}"
+```
+
+with:
+
+```python
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+run_slug = (
+    args.run_name
+    if args.run_name is not None
+    else f"{timestamp}_{uuid.uuid4().hex[:4]}"
+)
+```
+
+Also replace the current output-directory construction:
+
+```python
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+LOG_DIR = os.path.join(BASE_DIR, args.log_dir)
+SAVE_DIR = os.path.join(BASE_DIR, args.save_dir)
+RUN_DIR = os.path.join(SAVE_DIR, run_slug)
+```
+
+with:
+
+```python
+def resolve_output_dir(path):
+    path = Path(path).expanduser()
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
+
+
+LOG_DIR = resolve_output_dir(args.log_dir)
+SAVE_DIR = resolve_output_dir(args.save_dir)
+RUN_DIR = SAVE_DIR / run_slug
+```
+
+Then:
+
+```python
+os.makedirs(LOG_DIR, exist_ok=True)
+
+if RUN_DIR.exists() and any(RUN_DIR.iterdir()):
+    raise FileExistsError(
+        f"Run directory already exists and is not empty: {RUN_DIR}"
+    )
+
+os.makedirs(RUN_DIR, exist_ok=True)
+```
+
+And immediately save:
+
+```python
+with open(RUN_DIR / "config.json", "w") as f:
+    json.dump(vars(args), f, indent=2)
+```
+
+The experiment shell script uses this `config.json` to automatically determine which LR won the short sweep.
+
+8. **Fix printing now that validation does not happen every step.**
+
+Replace the current logging code that assumes `val_loss.item()` always exists with:
+
+```python
+if step % args.print_every == 0:
+    if val_loss is not None:
+        logger.info(
+            f"Step {step}/{args.num_steps} - "
+            f"Train Loss: {loss.item():.4f}, "
+            f"Val Loss: {val_loss:.4f}, "
+            f"Tokens/s: {tokens_per_sec:,.0f}"
+        )
+    else:
+        logger.info(
+            f"Step {step}/{args.num_steps} - "
+            f"Train Loss: {loss.item():.4f}, "
+            f"Tokens/s: {tokens_per_sec:,.0f}"
+        )
+```
+
+9. **Remove the routine `torch.cuda.empty_cache()` before checkpointing.**
+
+Delete:
+
+```python
+if device.type == "cuda":
+    torch.cuda.empty_cache()
+```
+
+from:
+
+```python
+if step % args.save_every == 0:
+```
+
+`empty_cache()` does not make checkpointing require "contiguous memory", and routinely emptying the caching allocator can hurt performance.
+
+Leave your CPU-cloning logic for asynchronous checkpoint writes as-is:
+
+```python
+model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+```
+
+That clone is deliberately synchronous because handing live model tensors to another thread while training continues would introduce a race. What you have is therefore best described in the report as **asynchronous checkpoint disk I/O**, not a completely asynchronous checkpoint operation.
+
+10. **Write one final machine-readable run summary.**
+
+Immediately after training finishes and before the final logger message:
+
+```python
+total_wall_time = time.perf_counter() - start_time
+
+burn_in = min(
+    50,
+    max(1, len(throughputs) // 20),
+)
+
+steady_state_throughputs = throughputs[burn_in:]
+
+summary = {
+    "run_name": run_slug,
+    "total_wall_time": total_wall_time,
+    "total_tokens": args.num_steps
+    * args.batch_size
+    * args.context_length,
+    "mean_tokens_per_sec": float(np.mean(throughputs)),
+    "steady_state_tokens_per_sec": float(
+        np.median(steady_state_throughputs)
+        if steady_state_throughputs
+        else np.median(throughputs)
+    ),
+    "peak_vram_mb": (
+        torch.cuda.max_memory_allocated(device) / 1024**2
+        if device.type == "cuda"
+        else None
+    ),
+}
+
+with open(RUN_DIR / "summary.json", "w") as f:
+    json.dump(summary, f, indent=2)
+```
+
+That `summary.json` gives you almost everything required for the **Training Under Hardware Constraints** table without manually digging through logs.
+
+One deliberate choice: I did **not** add gradient accumulation, W&B, a larger experiment manager, architecture ablations, warmup sweeps, optimizer sweeps, or anything else. At this point those would make Assignment 1 larger rather than better. The shell script is already enough to produce the evidence needed for the very short artifact, and then you can move to Assignment 2.
