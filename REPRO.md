@@ -85,7 +85,7 @@ cd <repo-name>
 2. **Run (Direct Binary Method):**
 The safest way to run code is to point directly to the python binary in the cluster venv. This avoids path issues:
 ```bash
-./.venv_cluster/bin/python <your_script.py>
+./.venv_cluster/bin/python -m <your_script>
 
 ```
 

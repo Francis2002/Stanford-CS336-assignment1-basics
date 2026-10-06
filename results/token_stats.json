@@ -1,0 +1,16 @@
+{
+  "tinystories": {
+    "10000": {
+      "tokens": 5461210,
+      "bytes": 22502601,
+      "source": "data/TinyStoriesV2-GPT4-valid_token_ids_10000.bin (10922420 bytes / 2), data/TinyStoriesV2-GPT4-valid.txt"
+    }
+  },
+  "openwebtext": {
+    "32000": {
+      "tokens": 66401098,
+      "bytes": 289998753,
+      "source": "data/owt_valid_token_ids_32000.bin (132802196 bytes / 2), data/owt_valid.txt"
+    }
+  }
+}

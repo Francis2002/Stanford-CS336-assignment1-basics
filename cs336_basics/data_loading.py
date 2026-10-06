@@ -24,12 +24,12 @@ class TokenDataset(Dataset):
         
         return inputs, targets
 
-def load_data(x, batch_size, context_length, device):
+def load_data(x, batch_size, context_length, device, generator=None):
     """
     Legacy helper for synchronous sampling. 
     Maintains compatibility for simple scripts.
     """
-    starting_indices = torch.randint(0, len(x) - context_length, (batch_size,))
+    starting_indices = torch.randint(0, len(x) - context_length, (batch_size,), generator=generator)
     inputs = torch.stack([torch.from_numpy(x[idx : idx + context_length].astype("int64")) for idx in starting_indices])
     targets = torch.stack([torch.from_numpy(x[idx + 1 : idx + context_length + 1].astype("int64")) for idx in starting_indices])
     return inputs.to(device), targets.to(device)

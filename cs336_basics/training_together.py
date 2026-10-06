@@ -21,6 +21,7 @@ from cs336_basics.cross_entropy import cross_entropy
 from cs336_basics.rope import RotaryPositionalEmbedding
 
 import pickle
+import random
 from pathlib import Path
 import json
 import logging
@@ -139,9 +140,23 @@ if __name__ == "__main__":
     # Extensions
     parser.add_argument("--mixed_precision", action="store_true", help="Enable FP16/BF16 training")
     parser.add_argument("--async_io", action="store_true", help="Enable asynchronous logging and checkpointing")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    # Experiment control
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--eval_every", type=int, default=250)
+    parser.add_argument("--eval_batches", type=int, default=20)
     # Device
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
+
+    # Seed everything so that reported curves are reproducible
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     # Set device
     if args.device is None:
@@ -197,6 +212,13 @@ if __name__ == "__main__":
             print(f"Found token path: {args.val_path_tokens}")
         else:
             print("No token path provided. Tokenizing the validation data...")
+
+            # The vocab/merges are only resolved in the training branch above, which is skipped
+            # when the training tokens already exist, so fall back to the training-derived names
+            if args.vocab_path is None or args.merges_path is None:
+                args.vocab_path = args.train_path_text.replace(".txt", f"_vocab_{args.vocab_size}.json")
+                args.merges_path = args.train_path_text.replace(".txt", f"_merges_{args.vocab_size}.json")
+
             args.val_path_tokens = tokenize_data(args.val_path_text, args.merges_path, args.vocab_path, args.special_characters)
 
     # Load data efficiently with np.memmap
@@ -208,7 +230,7 @@ if __name__ == "__main__":
     model.to(device)
 
     # Torch Compile (Fused Kernels), kinda like jit
-    if device.type == "cuda":
+    if args.compile and device.type == "cuda":
         logger.info("Compiling model (torch.compile)...")
         model = torch.compile(model)
 
@@ -223,24 +245,22 @@ if __name__ == "__main__":
 
     # Parallel Data Loading
     train_dataset = TokenDataset(train_data, args.context_length)
-    val_dataset = TokenDataset(val_data, args.context_length)
-    
+
+    # Seeding the loader generator makes the per-worker sampling RNG reproducible
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed)
+
     # Workers for speedup
     train_loader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
-        num_workers=4, 
-        pin_memory=(device.type == "cuda")
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=args.batch_size, 
-        num_workers=4, 
-        pin_memory=(device.type == "cuda")
+        num_workers=args.num_workers, 
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+        generator=train_generator
     )
     
     train_iter = iter(train_loader)
-    val_iter = iter(val_loader)
 
     # Mixed Precision Setup
     scaler = torch.amp.GradScaler("cuda") if args.mixed_precision and device.type == "cuda" else None
@@ -250,7 +270,7 @@ if __name__ == "__main__":
 
     # Experiment naming with slugs
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_slug = f"{timestamp}_{uuid.uuid4().hex[:4]}"
+    run_slug = args.run_name if args.run_name is not None else f"{timestamp}_{uuid.uuid4().hex[:4]}"
     
     # Define directories
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -275,19 +295,56 @@ if __name__ == "__main__":
     
     # Metrics logging path
     metrics_path = os.path.join(RUN_DIR, "metrics.jsonl")
+
+    # Written up front so that sweep tooling can read the config without waiting for a checkpoint
+    with open(os.path.join(RUN_DIR, "config.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
     
     logger.info(f"Starting run {run_slug}. Logging to {RUN_DIR}")
 
     # Initialize Rope
     rope = RotaryPositionalEmbedding(args.rope_theta, args.d_model // args.num_heads, args.context_length, device=device)
 
+    # A single fixed validation set, so every run in a sweep is scored on identical batches
+    val_generator = torch.Generator()
+    val_generator.manual_seed(args.seed + 1)
+    fixed_val_batches = [
+        load_data(val_data, args.batch_size, args.context_length, device, generator=val_generator)
+        for _ in range(args.eval_batches)
+    ]
+
+    def evaluate():
+        model.eval()
+        losses = []
+        with torch.no_grad():
+            for x_val, y_val in fixed_val_batches:
+                with torch.amp.autocast("cuda", enabled=(args.mixed_precision and device.type == "cuda")):
+                    losses.append(cross_entropy(model(x_val, rope=rope), y_val).item())
+        model.train()
+        return float(np.mean(losses))
+
+    throughputs = []
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
     start_time = time.perf_counter()
     
     # Training Loop
     for step in range(iteration, args.num_steps + 1):
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        step_start = time.perf_counter()
         
         # Training
         optimizer.zero_grad()
+
+        # The LR must be set before the update, otherwise every step (including the very
+        # first one) trains with the previous step's learning rate and warmup is shifted
+        lr = learning_rate_schedule(step, args.learning_rate_base, args.learning_rate_min, args.steps_for_warmup, args.steps_for_cosine)
+        
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
         
         # Pull next batch from background workers
         try:
@@ -296,7 +353,8 @@ if __name__ == "__main__":
             train_iter = iter(train_loader)
             x, y = next(train_iter)
             
-        x, y = x.to(device), y.to(device)
+        x = x.to(device, non_blocking=(device.type == "cuda"))
+        y = y.to(device, non_blocking=(device.type == "cuda"))
 
         # Mixed Precision Forward Pass
         # autocast allows matmuls to run in float16/bf16 for speed and memory savings
@@ -320,31 +378,30 @@ if __name__ == "__main__":
                 gradient_clipping(model.parameters(), args.max_grad_norm)
             optimizer.step()
 
-        lr = learning_rate_schedule(step, args.learning_rate_base, args.learning_rate_min, args.steps_for_warmup, args.steps_for_cosine)
-        
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        step_time = time.perf_counter() - step_start
 
-        # Validation
-        with torch.no_grad():
-            try:
-                x_val, y_val = next(val_iter)
-            except StopIteration:
-                val_iter = iter(val_loader)
-                x_val, y_val = next(val_iter)
-            
-            x_val, y_val = x_val.to(device), y_val.to(device)
-            
-            with torch.amp.autocast("cuda", enabled=(args.mixed_precision and device.type == "cuda")):
-                y_pred_val = model(x_val, rope=rope)
-                val_loss = cross_entropy(y_pred_val, y_val)
+        tokens_this_step = args.batch_size * args.context_length
+        tokens_seen = step * tokens_this_step
+        tokens_per_sec = tokens_this_step / step_time
+        throughputs.append(tokens_per_sec)
+
+        # Validation on a schedule only, so that a validation forward pass is not folded
+        # into every training step and into every throughput measurement
+        val_loss = None
+        if step == 1 or step % args.eval_every == 0 or step == args.num_steps:
+            val_loss = evaluate()
 
         # Log metrics every step (streaming to JSONL), with asynchronous logging
         metrics = {
             "step": step,
+            "tokens_seen": tokens_seen,
             "wall_time": time.perf_counter() - start_time,
+            "step_time": step_time,
+            "tokens_per_sec": tokens_per_sec,
             "train_loss": loss.item(),
-            "val_loss": val_loss.item(),
+            "val_loss": val_loss,
             "lr": lr,
         }
         
@@ -358,12 +415,12 @@ if __name__ == "__main__":
             save_metrics(metrics_path, metrics)
 
         if step % args.print_every == 0:
-            logger.info(f"Step {step}/{args.num_steps} - Train Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}")
+            if val_loss is not None:
+                logger.info(f"Step {step}/{args.num_steps} - Train Loss: {loss.item():.4f}, Val Loss: {val_loss:.4f}, Tokens/s: {tokens_per_sec:,.0f}")
+            else:
+                logger.info(f"Step {step}/{args.num_steps} - Train Loss: {loss.item():.4f}, Tokens/s: {tokens_per_sec:,.0f}")
 
         if step % args.save_every == 0:
-            # Clear CUDA cache before checkpointing to ensure contiguous memory for saving
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
             checkpoint_path = os.path.join(RUN_DIR, f"checkpoint_{step:06d}.pt")
             
             # Asynchronous Checkpointing
@@ -391,7 +448,24 @@ if __name__ == "__main__":
         # This prevents PyTorch's allocator from experiencing peak overlap, 
         # when allocating the forward pass of step N+1 while the backward pass graphs of step N are still in scope
         del x, y, y_pred, loss
-        del x_val, y_val, y_pred_val, val_loss
+
+    total_wall_time = time.perf_counter() - start_time
+
+    # Drop the warmup/compilation steps before reporting steady-state throughput
+    burn_in = min(50, max(1, len(throughputs) // 20))
+    steady_state = throughputs[burn_in:] or throughputs
+
+    summary = {
+        "run_name": run_slug,
+        "total_wall_time": total_wall_time,
+        "total_tokens": args.num_steps * args.batch_size * args.context_length,
+        "mean_tokens_per_sec": float(np.mean(throughputs)),
+        "steady_state_tokens_per_sec": float(np.median(steady_state)),
+        "peak_vram_mb": torch.cuda.max_memory_allocated(device) / 1024**2 if device.type == "cuda" else None,
+    }
+
+    with open(os.path.join(RUN_DIR, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
 
     if executor:
         executor.shutdown(wait=True)

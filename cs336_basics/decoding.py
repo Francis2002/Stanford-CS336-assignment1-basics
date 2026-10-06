@@ -36,7 +36,7 @@ def get_config_from_checkpoint(checkpoint_path):
     run_slug = parent.name
     return config, run_slug
 
-def decode(model, x, rope, eot_token_id, max_length, temp=None, top_p=None, device=None):
+def decode(model, x, rope, eot_token_id, max_length, temp=None, top_p=None, device=None, context_length=None):
     """
     Decodes the given input sequence using the given model and parameters.
     
@@ -55,8 +55,12 @@ def decode(model, x, rope, eot_token_id, max_length, temp=None, top_p=None, devi
     total_tokens_generated = 0
     with torch.no_grad():
         while x[0, -1] != eot_token_id and total_tokens_generated < max_length:
+            # RoPE only has tables for context_length positions, so condition on the
+            # most recent window rather than the whole sequence
+            x_window = x if context_length is None else x[:, -context_length:]
+
             # Get logits
-            logits = model(x, rope=rope) # Shape (batch_size, context_length, vocab_size)
+            logits = model(x_window, rope=rope) # Shape (batch_size, context_length, vocab_size)
 
             # Get next token logits
             next_token_logits = logits[0, -1]
@@ -161,7 +165,8 @@ if __name__ == "__main__":
     eot_token_id = tokenizer.reverse_vocab[b'<|endoftext|>']
 
     # Decode
-    generated_tokens = decode(model, x, rope, eot_token_id, args.max_length, args.temp, args.top_p, device)
+    generated_tokens = decode(model, x, rope, eot_token_id, args.max_length, args.temp, args.top_p, device,
+                              context_length=config["context_length"])
     generated_text = tokenizer.decode(generated_tokens.tolist())
     
     # Save output
